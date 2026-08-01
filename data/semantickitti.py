@@ -286,30 +286,3 @@ def build_dataloaders(
         pin_memory=True,
     )
     return train_loader, val_loader
-
-if __name__ == "__main__":
-    import sys
-
-    print(f"SemanticKITTI class names: {len(SemanticKITTI_CLASS_NAMES)} classes")
-    print(f"Learning map entries:     {len(SemanticKITTI_LEARNING_MAP)} raw → train")
-
-    np.random.seed(42)
-    N = 50000
-    fake_points = np.zeros((N, 4), dtype=np.float32)
-    fake_points[:, 0] = np.random.randn(N) * 10
-    fake_points[:, 1] = np.random.randn(N) * 10
-    fake_points[:, 2] = np.random.randn(N) * 3
-    fake_points[:, 3] = np.random.rand(N)
-
-    rv, _ = _spherical_projection_vectorized(fake_points, None, 64, 2048, 3.0, -25.0)
-    fill_rate = (rv[:, :, 3] > 0).mean() * 100
-    print(f"\nSynthetic projection: {rv.shape} — {fill_rate:.1f}% pixels filled")
-
-    if len(sys.argv) > 1:
-        ds = SemanticKITTIRangeView(sys.argv[1], split="train")
-        print(f"\nDataset: {len(ds)} samples from {sys.argv[1]}")
-        sample = ds[0]
-        print(f"  range_view: {tuple(sample['range_view'].shape)}  "
-              f"({sample['range_view'].dtype})")
-        print(f"  labels:     {tuple(sample['labels'].shape)}  "
-              f"(classes present: {torch.unique(sample['labels']).tolist()})")

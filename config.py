@@ -157,16 +157,3 @@ class Config:
         with open(path, "w", encoding="utf-8") as f:
             yaml.safe_dump(out, f, default_flow_style=False, sort_keys=False)
 
-def load_config(path: str | Path | None = None) -> Config:
-    if path is None:
-        path = Path(__file__).resolve().parent / "configs" / "default.yaml"
-    return Config.from_yaml(path)
-
-if __name__ == "__main__":
-    cfg = load_config()
-    print("=== Model ===")
-    for f in fields(cfg.model):
-        print(f"  {f.name}: {getattr(cfg.model, f.name)}")
-    print("\n=== Training ===")
-    for f in fields(cfg.train):
-        print(f"  {f.name}: {getattr(cfg.train, f.name)}")

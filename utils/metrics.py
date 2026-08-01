@@ -72,9 +72,3 @@ class SegmentationMetrics:
         ]
         return "\n".join(lines)
 
-if __name__ == "__main__":
-    m = SegmentationMetrics(num_classes=5, ignore_index=5)
-    pred = torch.tensor([[0, 1, 2], [3, 4, 5]])
-    target = torch.tensor([[0, 1, 2], [3, 4, 5]])
-    m.update(pred, target)
-    print(m.summary())
