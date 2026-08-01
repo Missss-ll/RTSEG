@@ -11,13 +11,27 @@ gated fusion.
 ## Files
 
 ```
-models/
-├── __init__.py
-├── rel_mamba.py             # 4-direction cross-scan SSM block
-├── local_transformer.py     # Window-based local transformer (W-MSA / SW-MSA)
-├── gated_fusion.py          # Gated fusion (basic + bottleneck variants)
-├── rmt_seg.py               # Full RMTSeg network
-└── losses.py                # ReliabilityLoss, ReferenceLoss, RMTLoss
+├── models/
+│   ├── __init__.py
+│   ├── rel_mamba.py             # 4-direction cross-scan SSM block
+│   ├── local_transformer.py     # Window-based local transformer (W-MSA / SW-MSA)
+│   ├── gated_fusion.py          # Gated fusion (basic + bottleneck variants)
+│   ├── rmt_seg.py               # Full RMTSeg network
+│   └── losses.py                # ReliabilityLoss, ReferenceLoss, RMTLoss
+├── data/
+│   ├── __init__.py
+│   └── semantickitti.py         # SemanticKITTI dataset + spherical projection
+├── utils/
+│   ├── __init__.py
+│   ├── reliability.py           # Physical-prior reliability weights
+│   ├── window_select.py         # Difficulty-based adaptive window selection
+│   ├── metrics.py               # mIoU / per-class IoU metrics
+│   └── checkpoint.py            # Checkpoint save/load
+├── configs/
+│   └── default.yaml             # Training hyperparameters
+├── config.py                    # Configuration management
+├── train.py                     # Training script
+└── eval.py                      # Evaluation script
 ```
 
 ## Quick start
@@ -28,9 +42,14 @@ from models import RMTSeg, RMTLoss
 model = RMTSeg(in_channels=5, num_classes=20)
 criterion = RMTLoss(num_classes=20, lambda_rel=1.0, lambda_ref=0.1)
 
-# Input:  range-view (B, 5, H, W)
-# Output: logits    (B, 20, H, W)
 logits = model(range_view)
+```
+
+## Training
+
+```bash
+python train.py --data-root ./data/SemanticKITTI
+python eval.py --checkpoint checkpoints/best.pt --data-root ./data/SemanticKITTI
 ```
 
 ## Variants
@@ -45,6 +64,8 @@ logits = model(range_view)
 
 - Python >= 3.10
 - PyTorch >= 2.0
+- PyYAML
+- tqdm
 - (optional) `mamba-ssm` for real SSM backend; falls back to Conv1d otherwise
 
 ## License

@@ -1,10 +1,3 @@
-"""
-RMTSeg: lightweight U-Net for LiDAR semantic segmentation on range-view images.
-
-Each encoder stage runs a RelMambaBlock and a LocalTransformerBlock in parallel,
-fuses them via GatedFusion, then downsamples. Decoder stages upsample with
-skip connections from the encoder.
-"""
 
 import torch
 import torch.nn as nn
@@ -13,14 +6,9 @@ import torch.nn.functional as F
 from .rel_mamba import RelMambaBlock
 from .local_transformer import LocalTransformerBlock
 from .gated_fusion import GatedFusion, GatedFusionV2
-
-
-# ------------------------------------------------------------------
-#  Stem
-# ------------------------------------------------------------------
+from utils.window_select import AdaptiveLocalTransformer
 
 class StemBlock(nn.Module):
-    """Two 3x3 convs (BN + SiLU) projecting raw channels to embed_dim."""
 
     def __init__(self, in_channels: int, embed_dim: int,
                  stem_stride: int = 1) -> None:
@@ -38,19 +26,15 @@ class StemBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.conv(x)
 
-
-# ------------------------------------------------------------------
-#  RMT Block  (Mamba + Transformer → fused)
-# ------------------------------------------------------------------
-
 class RMTBlock(nn.Module):
-    """One fusion block: RelMambaBlock ‖ LocalTransformerBlock → GatedFusion."""
 
     def __init__(self, dim: int, mamba_d_state: int = 16, mamba_expand: int = 2,
                  num_heads: int = 8, window_size: int = 7, shift_size: int = 0,
                  mlp_ratio: float = 4.0, use_mamba_ssm: bool = False,
                  gate_v2: bool = False, attn_drop: float = 0.0,
-                 proj_drop: float = 0.0, drop_path: float = 0.0) -> None:
+                 proj_drop: float = 0.0, drop_path: float = 0.0,
+                 adaptive_window: bool = False,
+                 window_keep_ratio: float = 0.7) -> None:
         super().__init__()
 
         self.mamba = RelMambaBlock(dim=dim, d_state=mamba_d_state,
@@ -59,27 +43,34 @@ class RMTBlock(nn.Module):
         if drop_path > 0.0:
             self.mamba.drop_path = nn.Dropout(drop_path)
 
-        self.transformer = LocalTransformerBlock(
-            dim=dim, num_heads=num_heads, window_size=window_size,
-            mlp_ratio=mlp_ratio, shift_size=shift_size, attn_drop=attn_drop,
-            drop=proj_drop, drop_path=drop_path,
-        )
+        if adaptive_window:
+            self.transformer = AdaptiveLocalTransformer(
+                dim=dim, num_heads=num_heads, window_size=window_size,
+                keep_ratio=window_keep_ratio, shift_size=shift_size,
+                mlp_ratio=mlp_ratio, drop=proj_drop, attn_drop=attn_drop,
+                drop_path=drop_path,
+            )
+        else:
+            self.transformer = LocalTransformerBlock(
+                dim=dim, num_heads=num_heads, window_size=window_size,
+                mlp_ratio=mlp_ratio, shift_size=shift_size, attn_drop=attn_drop,
+                drop=proj_drop, drop_path=drop_path,
+            )
 
+        self.adaptive_window = adaptive_window
         gate_cls = GatedFusionV2 if gate_v2 else GatedFusion
         self.fusion = gate_cls(dim=dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fusion(self.mamba(x), self.transformer(x))
-
-
-# ------------------------------------------------------------------
-#  Encoder / Decoder stages
-# ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor,
+                difficulty_map: torch.Tensor | None = None) -> torch.Tensor:
+        f_global = self.mamba(x)
+        if self.adaptive_window:
+            f_local = self.transformer(x, difficulty_map)
+        else:
+            f_local = self.transformer(x)
+        return self.fusion(f_global, f_local)
 
 class EncoderStage(nn.Module):
-    """N × RMTBlock → downsample (3x3 conv, stride 2).
-
-    Returns (downsampled_out, pre-downsample_skip)."""
 
     def __init__(self, dim: int, out_dim: int, num_blocks: int = 1,
                  downsample: bool = True, **rmt_kwargs) -> None:
@@ -88,11 +79,10 @@ class EncoderStage(nn.Module):
         blocks = []
         for i in range(num_blocks):
             blk = RMTBlock(dim=dim, **rmt_kwargs)
-            # Alternate W-MSA / SW-MSA within the stage
             if i % 2 == 1 and 'window_size' in rmt_kwargs:
                 blk.transformer.shift_size = rmt_kwargs['window_size'] // 2
             blocks.append(blk)
-        self.blocks = nn.Sequential(*blocks)
+        self.blocks = nn.ModuleList(blocks)
 
         self.downsample = downsample
         if downsample:
@@ -105,8 +95,11 @@ class EncoderStage(nn.Module):
             self.proj = (nn.Conv2d(dim, out_dim, 1, bias=False)
                          if dim != out_dim else nn.Identity())
 
-    def forward(self, x: torch.Tensor):
-        x = self.blocks(x)
+    def forward(self, x: torch.Tensor,
+                difficulty_map: torch.Tensor | None = None
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        for blk in self.blocks:
+            x = blk(x, difficulty_map)
         skip = x
         if self.downsample:
             x = self.down_conv(x)
@@ -114,9 +107,7 @@ class EncoderStage(nn.Module):
             x = self.proj(x)
         return x, skip
 
-
 class DecoderStage(nn.Module):
-    """Upsample (2x bilinear) → concat skip → two 3x3 convs."""
 
     def __init__(self, in_dim: int, skip_dim: int, out_dim: int) -> None:
         super().__init__()
@@ -137,13 +128,7 @@ class DecoderStage(nn.Module):
         x = torch.cat([x, skip], dim=1)
         return self.fuse(x)
 
-
-# ------------------------------------------------------------------
-#  Segmentation head
-# ------------------------------------------------------------------
-
 class SegHead(nn.Module):
-    """3x3 refine → dropout → 1x1 classifer, with optional stem skip."""
 
     def __init__(self, in_dim: int, stem_dim: int, num_classes: int,
                  stem_skip: bool = True, dropout: float = 0.1) -> None:
@@ -169,20 +154,7 @@ class SegHead(nn.Module):
         x = self.dropout(x)
         return self.classifier(x)
 
-
-# ------------------------------------------------------------------
-#  RMTSeg  — full network
-# ------------------------------------------------------------------
-
 class RMTSeg(nn.Module):
-    """U-Net with VMamba + window-attention encoder, bilinear decoder.
-
-    in_channels  — input channels (e.g. 5 for x,y,z,range,intensity)
-    num_classes  — number of semantic categories
-    embed_dim    — base channels (doubled per stage)
-    num_stages   — encoder-decoder depth
-    num_blocks   — RMT blocks per stage (int or list)
-    """
 
     def __init__(self, in_channels: int = 5, num_classes: int = 20,
                  embed_dim: int = 64, num_stages: int = 3,
@@ -193,7 +165,9 @@ class RMTSeg(nn.Module):
                  use_mamba_ssm: bool = False, gate_v2: bool = False,
                  attn_drop: float = 0.0, proj_drop: float = 0.0,
                  drop_path_rate: float = 0.0,
-                 head_dropout: float = 0.1) -> None:
+                 head_dropout: float = 0.1,
+                 adaptive_window: bool = False,
+                 window_keep_ratio: float = 0.7) -> None:
         super().__init__()
 
         if isinstance(num_blocks, int):
@@ -206,7 +180,6 @@ class RMTSeg(nn.Module):
         enc_dims = [embed_dim * (2 ** i) for i in range(num_stages)]
         bottleneck_dim = embed_dim * (2 ** num_stages)
 
-        # Stochastic depth schedule
         total_blocks = sum(num_blocks)
         dp_rates = [drop_path_rate * i / max(total_blocks - 1, 1)
                     for i in range(total_blocks)]
@@ -215,9 +188,10 @@ class RMTSeg(nn.Module):
                           num_heads=num_heads, window_size=window_size,
                           mlp_ratio=mlp_ratio, use_mamba_ssm=use_mamba_ssm,
                           gate_v2=gate_v2, attn_drop=attn_drop,
-                          proj_drop=proj_drop)
+                          proj_drop=proj_drop,
+                          adaptive_window=adaptive_window,
+                          window_keep_ratio=window_keep_ratio)
 
-        # Encoder
         block_idx = 0
         self.encoder_stages = nn.ModuleList()
         for i, in_dim in enumerate(enc_dims):
@@ -236,7 +210,6 @@ class RMTSeg(nn.Module):
                 blk.transformer.drop_path1 = nn.Dropout(dp) if dp > 0 else nn.Identity()
                 blk.transformer.drop_path2 = nn.Dropout(dp) if dp > 0 else nn.Identity()
 
-        # Bottleneck
         n_blk_bn = num_blocks[-1]
         stage_dp = dp_rates[block_idx:block_idx + n_blk_bn]
         self.bottleneck = EncoderStage(
@@ -249,7 +222,6 @@ class RMTSeg(nn.Module):
             blk.transformer.drop_path1 = nn.Dropout(dp) if dp > 0 else nn.Identity()
             blk.transformer.drop_path2 = nn.Dropout(dp) if dp > 0 else nn.Identity()
 
-        # Decoder
         self.decoder_stages = nn.ModuleList()
         dec_in_dim = bottleneck_dim
         for skip_dim in reversed(enc_dims):
@@ -258,7 +230,6 @@ class RMTSeg(nn.Module):
                              out_dim=skip_dim))
             dec_in_dim = skip_dim
 
-        # Head
         self.head = SegHead(in_dim=embed_dim, stem_dim=embed_dim,
                             num_classes=num_classes, stem_skip=stem_skip,
                             dropout=head_dropout)
@@ -283,36 +254,30 @@ class RMTSeg(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor,
+                difficulty_map: torch.Tensor | None = None) -> torch.Tensor:
         stem_feat = self.stem(x)
 
         feats = stem_feat
         skips: list[torch.Tensor] = []
         for stage in self.encoder_stages:
-            feats, skip = stage(feats)
+            feats, skip = stage(feats, difficulty_map)
             skips.append(skip)
 
-        feats, _ = self.bottleneck(feats)
+        feats, _ = self.bottleneck(feats, difficulty_map)
 
         for i, stage in enumerate(self.decoder_stages):
             feats = stage(feats, skips[-(i + 1)])
 
         return self.head(feats, stem_feat)
 
-
-# ------------------------------------------------------------------
-#  Pre-built variants
-# ------------------------------------------------------------------
-
 def rmt_seg_tiny(in_channels: int = 5, num_classes: int = 20, **kwargs) -> RMTSeg:
     return RMTSeg(in_channels=in_channels, num_classes=num_classes,
                   embed_dim=32, num_stages=3, num_blocks=1, **kwargs)
 
-
 def rmt_seg_small(in_channels: int = 5, num_classes: int = 20, **kwargs) -> RMTSeg:
     return RMTSeg(in_channels=in_channels, num_classes=num_classes,
                   embed_dim=64, num_stages=3, num_blocks=1, **kwargs)
-
 
 def rmt_seg_base(in_channels: int = 5, num_classes: int = 20, **kwargs) -> RMTSeg:
     return RMTSeg(in_channels=in_channels, num_classes=num_classes,

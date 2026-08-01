@@ -1,6 +1,3 @@
-"""
-RTSEG models package — Lightweight Semantic Segmentation with Gated VMamba.
-"""
 
 from .rel_mamba import RelMambaBlock
 from .local_transformer import LocalTransformerBlock
